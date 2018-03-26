@@ -1,0 +1,254 @@
+---
+title: "Théo_Tortorici_ML"
+output: html_document
+---
+
+
+### 1. Packages
+
+```{r}
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(caret)
+library(moments)
+library(glmnet)
+library(knitr)
+library(outliers)
+
+
+options(width=100)
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r}
+training_data = read.csv("~/Desktop/Machine Learning 2/train.csv")
+test_data = read.csv("~/Desktop/Machine Learning 2/test.csv")
+
+```
+
+
+### 2. Data Understanding 
+
+
+```{r}
+# The percentage of data missing in train.
+sum(is.na(training_data)) / (nrow(training_data) *ncol(training_data))
+
+# The percentage of data missing in test.
+sum(is.na(test_data)) / (nrow(test_data) * ncol(test_data))
+```
+
+```{r}
+# Visualisation of missinhg values
+plot_Missing <- function(data_in, title = NULL) {
+  temp_df <- as.data.frame(ifelse(is.na(data_in), 0, 1))
+  temp_df <- temp_df[,order(colSums(temp_df))]
+  data_temp <- expand.grid(list(x = 1:nrow(temp_df), y = colnames(temp_df)))
+  data_temp$m <- as.vector(as.matrix(temp_df))
+  data_temp <- data.frame(x = unlist(data_temp$x), y = unlist(data_temp$y), m = unlist(data_temp$m))
+  ggplot(data_temp) + geom_tile(aes(x=x, y=y, fill=factor(m))) + scale_fill_manual(values=c("white", "black"), name="Missing\n(0=Yes, 1=No)") + theme_light() + ylab("") + xlab("") + ggtitle(title)
+}
+
+
+plot_Missing(training_data[,colSums(is.na(training_data)) > 0])
+```
+
+
+### 3. Data Pre-Processing
+
+```{r}
+# for an easier cleaning, let's bind the two datasets
+all_data = rbind(training_data[ ,-which(names(training_data) %in% c("Id","SalePrice"))], test_data[ ,-which(names(test_data) %in% c("Id","SalePrice"))])
+```
+
+```{r}
+# get data frame of SalePrice and log(SalePrice + 1) for plotting
+df <- rbind(data.frame(version="log(price+1)",x=log(training_data$SalePrice + 1)), data.frame(version="price",x=training_data$SalePrice))
+
+# plot histogram
+ggplot(data=df) +
+  facet_wrap(~version,ncol=2,scales="free_x") +
+  geom_histogram(aes(x=x))
+```
+
+```{r}
+# Dealing with missing Values
+
+# pool QC : Replacce na values with none
+all_data$PoolQC[is.na(all_data$PoolQC)] <- "None"
+
+# MiscFfeature
+all_data$MiscFeature[is.na(all_data$MiscFeature)] <- 'None'
+
+# Fence
+all_data$Fence[is.na(all_data$Fence)] <- "None"
+
+# Alley
+all_data$Alley[is.na(all_data$Alley)] <- "None"
+
+# Fire Place Qu
+all_data$FireplaceQu[is.na(all_data$FireplaceQu)] <- 'None'
+
+# LotFrontage
+# LotFrontage of all the neighborhood
+lot.f = aggregate(LotFrontage ~ Neighborhood, data = all_data, median)
+lot.f2 = c()
+for (str in all_data$Neighborhood[is.na(all_data$LotFrontage)]) {
+  lot.f2 = c(lot.f2, which(lot.f$Neighborhood == str))
+}
+all_data$LotFrontage[is.na(all_data$LotFrontage)] = lot.f[lot.f2, 2]
+
+
+# Garage
+gar.cols <- c('GarageCond','GarageQual','GarageType','GarageFinish')
+for (x in gar.cols){
+  all_data[x][is.na(all_data[x])] <- 'None'
+}
+
+# Basement category feature                
+for(i in c('BsmtExposure', 'BsmtCond','BsmtQual','BsmtFinType2', 'BsmtFinType1')){
+  all_data[i][is.na(all_data[i])] <- 'None'
+}
+
+# massVnr Type
+all_data$MasVnrType[is.na(all_data$MasVnrType)] <- 'None'
+
+# MS zoning
+all_data$MSZoning[is.na(all_data$MSZoning)] <- 'RL'
+
+# Utilities
+all_data <- all_data[,!names(all_data) %in% c('Utilities')]
+
+# Functional
+all_data$Functional[is.na(all_data$Functional)] <- 'Typ'
+
+# Electrical
+# Replace NA with most Common
+all_data$Electrical[is.na(all_data$Electrical)] <- 'SBrkr'
+
+# Kitchen Qual
+all_data$KitchenQual[is.na(all_data$KitchenQual)] <- 'TA' # most common
+
+# Exterior
+# Replace Na with most common occurence
+for(i in c('Exterior1st', 'Exterior2nd')){
+  all_data[i][is.na(all_data[i])] <- 'VinylSd'
+}
+
+# Sale Type
+# Replace with most common
+all_data$SaleType[is.na(all_data$SaleType)] <- 'WD'
+
+# MSScubClass
+all_data$MSSubClass[is.na(all_data$MSSubClass)] <- 'None'
+```
+
+
+```{r}
+# transform SalePrice target to log form
+training_data$SalePrice <- log(training_data$SalePrice + 1)
+
+# for numeric feature with excessive skewness, perform log transformation
+# first get data type for each feature
+feature_classes <- sapply(names(all_data),function(x){class(all_data[[x]])})
+numeric_feats <-names(feature_classes[feature_classes == "integer" | feature_classes == "numeric"])
+
+# determine skew for each numeric feature
+skewed_feats <- sapply(numeric_feats,function(x){skewness(all_data[[x]],na.rm=TRUE)})
+
+# keep only features that exceed a threshold for skewness
+skewed_feats <- skewed_feats[skewed_feats > 0.75]
+
+# transform excessively skewed features with log(x + 1)
+for(x in names(skewed_feats)) {
+  all_data[[x]] <- log(all_data[[x]] + 1)
+}
+```
+
+
+```{r}
+# dealing with numerical NAs
+# for any missing values in numeric features, impute median of that feature
+numeric_df <- all_data[numeric_feats]
+
+for (x in numeric_feats) {
+    median_value <- median(training_data[[x]],na.rm = TRUE)
+    all_data[[x]][is.na(all_data[[x]])] <- median_value
+}
+```
+
+
+```{r}
+# get names of categorical features
+categorical_feats <- names(feature_classes[feature_classes == "factor"])
+
+# use caret dummyVars function for hot one encoding for categorical features
+dummies <- dummyVars(~.,all_data[categorical_feats])
+categorical_1 <- predict(dummies,all_data[categorical_feats])
+categorical_1[is.na(categorical_1)] <- 0  #for any level that was NA, set to zero
+```
+
+```{r}
+# reconstruct all_data with pre-processed data
+all_data <- cbind(all_data[numeric_feats],categorical_1)
+
+# create data for training and test
+X_train <- all_data[1:nrow(training_data),]
+X_test <- all_data[(nrow(training_data)+1):nrow(all_data),]
+y <- training_data$SalePrice
+```
+
+
+### 4. Model
+
+```{r}
+# set up caret model training parameters
+# model specific training parameter
+train_control <- trainControl(method="repeatedcv",
+                                 number=5,
+                                 repeats=5,
+                                 verboseIter=FALSE)
+```
+
+```{r}
+# test out Lasso regression model
+
+# train model
+set.seed(123)  # for reproducibility
+model_lasso <- train(x=X_train,y=y,
+                  method="glmnet",
+                  metric="RMSE",
+                  maximize=FALSE,
+                  trControl=train_control,
+                  tuneGrid=expand.grid(alpha=1,  # Lasso regression
+                                       lambda=c(1,0.1,0.05,0.01,seq(0.009,0.001,-0.001),
+                                            0.00075,0.0005,0.0001)))
+model_lasso
+
+mean(model_lasso$resample$RMSE)
+```
+
+```{r}
+# extract coefficients for the best performing model
+coef <- data.frame(coef.name = dimnames(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda))[[1]], coef.value = matrix(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda)))
+
+# print summary of model results
+kept_features <- nrow(filter(coef,coef.value!=0))
+print(kept_features)
+```
+
+
+### 5. Submission file 
+
+```{r}
+# make create submission file
+preds <- exp(predict(model_lasso,newdata=X_test)) - 1
+```
+
+```{r}
+# construct data frame for solution
+solution <- data.frame(Id=as.integer(rownames(X_test)),SalePrice=preds)
+write.csv(solution,"Théo_Tortorici_ML_HousePrices_V4.csv",row.names=FALSE)
+```
+
