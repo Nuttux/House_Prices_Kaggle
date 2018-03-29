@@ -1,4 +1,4 @@
-# House_Prices_Kaggle
+# HousePrices_Kaggle
 #kaggle #advanced #regression #R #house #prices
 
 
